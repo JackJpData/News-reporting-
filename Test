@@ -1,0 +1,553 @@
+import nest_asyncio
+nest_asyncio.apply()  # Enable async in Jupyter
+
+import asyncio
+import aiohttp
+import pandas as pd
+import hashlib
+from datetime import datetime, timedelta
+import os
+import pytz
+import holidays
+import random
+import json
+import shutil
+import logging # Import logging module
+
+# Memory threshold (e.g., 90% of available memory)
+MEMORY_THRESHOLD = 0.9
+
+#Cell 2
+# --- Logging Configuration ---
+# Custom formatter to use HKT time
+class HKTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        hkt_tz = pytz.timezone('Asia/Hong_Kong')
+        dt = datetime.fromtimestamp(record.created, tz=pytz.UTC).astimezone(hkt_tz)
+        return dt.strftime(datefmt or '%Y-%m-%d %H:%M:%S')
+
+# Clear existing handlers to prevent duplication
+logger = logging.getLogger('NewsMonitor')
+logger.handlers = []
+logger.setLevel(logging.INFO)
+
+file_handler = logging.FileHandler('monitor.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+formatter = HKTFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Discord Message Logger
+discord_logger = logging.getLogger('DiscordLogger')
+discord_logger.handlers = []
+discord_logger.setLevel(logging.INFO)
+discord_file_handler = logging.FileHandler('discord_messages.log', encoding='utf-8')
+discord_file_handler.setLevel(logging.INFO)
+discord_formatter = HKTFormatter('%(asctime)s - News ID: %(news_id)s - Message: %(discord_message)s')
+discord_file_handler.setFormatter(discord_formatter)
+discord_logger.addHandler(discord_file_handler)
+
+# Health Check Logger
+health_check_logger = logging.getLogger('HealthCheckLogger')
+health_check_logger.handlers = []
+health_check_logger.setLevel(logging.INFO)
+health_check_file_handler = logging.FileHandler('health_check.log', encoding='utf-8')
+health_check_file_handler.setLevel(logging.INFO)
+health_check_formatter = HKTFormatter('%(asctime)s - %(message)s')
+health_check_file_handler.setFormatter(health_check_formatter)
+health_check_logger.addHandler(health_check_file_handler)
+# --- End Logging Configuration ---
+
+# Configuration
+FINNHUB_API_KEY = "cumn7d1r01qsapi0gk1gcumn7d1r01qsapi0gk20"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1383694378014347375/vF5a3E5ePvHUCnJMk9zCdoApKdHsTbFBLzZ8ZaQPE6w7UhGodl44lF1o-YUhCa2B0WOv"
+DISCORD_ALERTS = True
+NEWS_STORAGE_DIR = "news_data"
+METADATA_FILE = os.path.join(NEWS_STORAGE_DIR, "latest_news_timestamps.json")
+TICKERS = [
+    "AAPL", "MSFT", "AMZN", "GOOGL", "TSLA", "NVDA", "JPM", "JNJ", "V", "PG",
+    "HD", "MA", "DIS", "PYPL", "BAC", "NFLX", "ADBE", "CRM", "KO", "PEP",
+    "TMO", "ABT", "AVGO", "CSCO", "CMCSA", "XOM", "WMT", "VZ", "MRK", "PFE",
+    "INTC", "T", "ABBV", "ORCL", "CVX", "ACN", "DHR", "MCD", "NKE", "PM"
+]
+BATCH_SIZE = 10
+
+os.makedirs(NEWS_STORAGE_DIR, exist_ok=True)
+
+#Cell 3 
+class NewsFetcher:
+    def __init__(self, api_key):
+        self.api_key = api_key
+
+    async def fetch_single_ticker_news(self, ticker, session):
+        request_time = datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+        current_date_str = datetime.now().strftime('%Y-%m-%d')
+        url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={current_date_str}&to={current_date_str}&token={self.api_key}"
+        
+        backoff = [10, 20, 40]  # Exponential backoff for retries
+        for retry in range(3):
+            try:
+                async with session.get(url) as response:
+                    response_time = datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+                    if response.status == 429:
+                        delay = backoff[retry]
+                        logger.warning(f"Rate limit hit for {ticker}. Retrying in {delay} seconds... (Attempt {retry+1})")
+                        await asyncio.sleep(delay)
+                        continue
+                    if response.status == 200:
+                        news = await response.json()
+                        logger.info(f"[API] Fetched {len(news)} items for {ticker} - Request: {request_time}, Response: {response_time}")
+                        processed_news = []
+                        for item in news:
+                            if 'datetime' in item and isinstance(item['datetime'], (int, float)):
+                                item['ticker'] = ticker
+                                item['id'] = self._generate_id(item)
+                                item['summary'] = item.get('summary', '')
+                                processed_news.append(item)
+                            else:
+                                logger.warning(f"[Warning] Skipping news item for {ticker} due to missing or invalid 'datetime': {item.get('headline', 'N/A')}")
+                        if not news:
+                            logger.info(f"[Info] No news returned for {ticker} at {response_time}")
+                        return processed_news
+                    else:
+                        logger.error(f"[Error] HTTP {response.status} for {ticker} at {response_time}. (Attempt {retry+1})")
+                        return []
+            except aiohttp.ClientError as e:
+                logger.error(f"[Error] Network error for {ticker} (retry {retry+1}): {e}")
+                await asyncio.sleep(backoff[retry])
+            except Exception as e:
+                logger.error(f"[Error] Unexpected error for {ticker} (retry {retry+1}): {e}")
+                await asyncio.sleep(backoff[retry])
+        logger.error(f"[Error] Failed to fetch news for {ticker} after 3 retries.")
+        return []
+
+    def _generate_id(self, item):
+        if 'datetime' not in item or not isinstance(item['datetime'], (int, float)):
+            logger.warning(f"Warning: 'datetime' missing or invalid in item for ID generation: {item.get('headline', 'N/A')}")
+            ts_str = datetime.now().strftime('%Y%m%d%H%M')
+        else:
+            ts_str = datetime.fromtimestamp(item['datetime']).strftime('%Y%m%d%H%M')
+        ticker_val = item.get('ticker', 'UNKNOWN_TICKER')
+        headline_val = item.get('headline', 'UNKNOWN_HEADLINE').encode()
+        return f"{ticker_val}_{ts_str}_{hashlib.md5(headline_val).hexdigest()[:6]}"
+
+    async def fetch_batch(self, tickers, session):
+        all_news = []
+        for ticker in tickers:
+            news_items = await self.fetch_single_ticker_news(ticker, session)
+            all_news.extend(news_items)
+            await asyncio.sleep(0.1)
+        return all_news
+
+class NewsProcessor:
+    def __init__(self, storage_dir, discord_webhook, discord_enabled):
+        self.storage_dir = storage_dir
+        self.discord_webhook = discord_webhook
+        self.discord_enabled = discord_enabled
+        self.latest_ticker_timestamps = self._load_metadata()
+
+    def _load_metadata(self):
+        if os.path.exists(METADATA_FILE):
+            try:
+                with open(METADATA_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"[Warning] Error loading metadata: {e}. Starting with empty metadata.")
+        return {}
+
+    def _save_metadata(self):
+        try:
+            os.makedirs(os.path.dirname(METADATA_FILE), exist_ok=True)
+            with open(METADATA_FILE, 'w') as f:
+                json.dump(self.latest_ticker_timestamps, f)
+        except Exception as e:
+            logger.error(f"[Error] Error saving metadata: {e}")
+
+    def _get_news_filepath(self, item):
+        if 'datetime' not in item or not isinstance(item['datetime'], (int, float)):
+            logger.warning(f"Warning: 'datetime' missing or invalid in item for path generation: {item.get('id', 'N/A')}")
+            timestamp = datetime.now()
+        else:
+            timestamp = datetime.fromtimestamp(item['datetime'])
+        date_str = timestamp.strftime('%Y-%m-%d')
+        ticker_dir = os.path.join(self.storage_dir, item['ticker'])
+        date_dir = os.path.join(ticker_dir, date_str)
+        os.makedirs(date_dir, exist_ok=True)
+        filename = f"{item['id']}.json"
+        return os.path.join(date_dir, filename)
+
+    def _news_exists(self, item):
+        filepath = self._get_news_filepath(item)
+        return os.path.exists(filepath)
+
+    async def _send_discord(self, message, news_id="N/A"):
+        if not self.discord_enabled:
+            return
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(3):
+                try:
+                    async with session.post(self.discord_webhook, json={"content": message, "username": "News Monitor"}) as response:
+                        if response.status == 200:
+                            logger.info(f"Discord message sent successfully for News ID: {news_id}")
+                            discord_logger.info("", extra={"news_id": news_id, "discord_message": message})
+                            return
+                        elif response.status == 429:
+                            retry_after = (await response.json()).get('retry_after', 1)
+                            logger.warning(f"[Warning] Rate limited sending Discord message for News ID {news_id}. Retrying after {retry_after}s.")
+                            await asyncio.sleep(retry_after)
+                        else:
+                            logger.error(f"[Error] Discord error sending message for News ID {news_id}: HTTP {response.status}")
+                            return
+                except Exception as e:
+                    logger.error(f"[Error] Discord error sending message for News ID {news_id}: {e}")
+                    await asyncio.sleep(2 ** attempt)
+
+    async def process_batch(self, news_items, session):
+        new_items_count = 0
+        hkt_tz = pytz.timezone('Asia/Hong_Kong')
+        send_time = datetime.now(hkt_tz).strftime('%Y-%m-%d %H:%M HKT')
+        for item in news_items:
+            if not self._news_exists(item):
+                try:
+                    filepath = self._get_news_filepath(item)
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        json.dump(item, f, ensure_ascii=False, indent=2)
+                    
+                    self.latest_ticker_timestamps[item['ticker']] = item['datetime']
+                    
+                    hkt_time = datetime.fromtimestamp(item['datetime'], tz=pytz.UTC).astimezone(hkt_tz).strftime('%Y-%m-%d %H:%M HKT')
+                    url_line = f"**URL**: {item['url']}\n" if item.get('url') else ""
+                    message = (
+                        "##############\n"
+                        f"**Title**: {item['headline']}\n"
+                        f"**Ticker**: {item['ticker']}\n"
+                        f"**Time**: {hkt_time}\n"
+                        f"{url_line}"
+                        f"**Summary**: ||{item['summary']}||\n"
+                        f"**Source**: {item.get('source', 'Unknown')}\n"
+                        "##############"
+                    )
+                    await self._send_discord(message, news_id=item['id'])
+                    logger.info(f"[Sent] Sent to Discord for {item['ticker']} at {send_time}")
+                    new_items_count += 1
+                except Exception as e:
+                    logger.error(f"[Error] Error saving news item {item.get('id', 'N/A')}: {e}")
+        self._save_metadata()
+        return new_items_count
+
+class HealthChecker:
+    def __init__(self, fetcher, processor, tickers):
+        self.fetcher = fetcher
+        self.processor = processor
+        self.tickers = tickers
+        self.pinned_message_id = 1384904190563975339
+        self.channel_id = "1383694378014347375"
+        self.incidents = []
+
+    async def log_health_check(self, message):
+        try:
+            health_check_logger.info(message)
+        except Exception as e:
+            logger.error(f"[Error] Failed to log to HealthCheckLogger: {e}")
+            self.incidents.append(f"Failed to log to health_check.log: {str(e)}")
+
+    async def _edit_pinned_message(self, message_content, news_id="N/A"):
+        if not self.processor.discord_enabled:
+            return
+        try:
+            edit_url = f"https://discord.com/api/v10/channels/{self.channel_id}/messages/{self.pinned_message_id}"
+            async with aiohttp.ClientSession() as session:
+                for attempt in range(3):
+                    async with session.patch(
+                        edit_url,
+                        headers={"Authorization": f"Bot {self.processor.discord_webhook.split('/')[-1]}"},
+                        json={"content": message_content}
+                    ) as response:
+                        if response.status == 200:
+                            logger.info(f"Edited pinned message {self.pinned_message_id} for News ID: {news_id}")
+                            discord_logger.info("", extra={"news_id": news_id, "discord_message": message_content})
+                            return
+                        elif response.status == 429:
+                            retry_after = (await response.json()).get('retry_after', 1)
+                            logger.warning(f"[Warning] Rate limited editing pinned message {self.pinned_message_id}. Retrying after {retry_after}s.")
+                            self.incidents.append(f"Rate limited editing pinned message: HTTP 429")
+                            await asyncio.sleep(retry_after)
+                        else:
+                            error = f"Failed to edit pinned message {self.pinned_message_id}: HTTP {response.status}"
+                            logger.error(f"[Error] {error}")
+                            self.incidents.append(error)
+                            return
+        except Exception as e:
+            logger.error(f"[Error] Failed to edit pinned message {self.pinned_message_id} for News ID {news_id}: {e}")
+            self.incidents.append(f"Failed to edit pinned message: {str(e)}")
+
+    async def check_missing_news(self, session, is_market_open):
+        self.incidents = []
+        hkt_tz = pytz.timezone('Asia/Hong_Kong')
+        now_hkt = datetime.now(hkt_tz).strftime('%Y-%m-%d %H:%M HKT')
+        if not is_market_open:
+            logger.info("Market is closed, skipping missing news check.")
+            await self.log_health_check(f"Market is closed, no missing news check performed at {now_hkt}.")
+            return
+        
+        if not self.processor.latest_ticker_timestamps:
+            message = f"[Warning] News database appears empty (no metadata found) at {now_hkt}! Check API or storage. Unless it is Sat, Sun or holiday, otherwise we have a problem of reaching no news for a long while."
+            await self.processor._send_discord(message, news_id="N/A")
+            await self.log_health_check(f"News database metadata is empty at {now_hkt}.")
+            self.incidents.append("News database metadata is empty.")
+            logger.warning("News database metadata is empty.")
+            return
+
+        if self.processor.latest_ticker_timestamps:
+            max_timestamp = max(self.processor.latest_ticker_timestamps.values())
+            if (datetime.now(pytz.UTC) - datetime.fromtimestamp(max_timestamp, tz=pytz.UTC)) > timedelta(hours=24):
+                message = f"[Warning] News database not updated in >24h at {now_hkt}! This might indicate a general issue. Unless it is Sat, Sun or holiday, otherwise we have a problem of reaching no news for a long while."
+                await self.processor._send_discord(message, news_id="N/A")
+                await self.log_health_check(f"News database not updated in >24h at {now_hkt}.")
+                self.incidents.append("News database not updated in >24h.")
+                logger.warning("Overall news database not updated in >24h.")
+        
+        missing_news_alerts = []
+        for ticker in self.tickers:
+            latest_time = self.processor.latest_ticker_timestamps.get(ticker, 0)
+            if latest_time == 0:
+                continue
+            latest_dt = datetime.fromtimestamp(latest_time, tz=pytz.UTC).astimezone(hkt_tz)
+            if (datetime.now(hkt_tz) - latest_dt) > timedelta(hours=6):
+                missing_news_alerts.append(f"- **{ticker}**: Latest news is >6h old ({latest_dt.strftime('%Y-%m-%d %H:%M HKT')})")
+                logger.warning(f"[Warning] Missing news for {ticker}: Latest news is >6h old.")
+
+        if missing_news_alerts:
+            alert_message = (
+                f"[Alert] **MISSING NEWS ALERT** at {now_hkt}\n\n"
+                "The following tickers have not had news updates for a significant period:\n"
+                + "\n".join(missing_news_alerts) +
+                "\n\n*Unless it is Saturday, Sunday, or a holiday, otherwise we have a problem of reaching no news for a long while.*"
+                "\n*Please manually pin this message for visibility.*"
+            )
+            await self.processor._send_discord(alert_message, news_id="MissingNews")
+            await self.log_health_check(f"Aggregated missing news alert sent to Discord at {now_hkt}.")
+            self.incidents.append("Missing news detected for some tickers.")
+            logger.info("Aggregated missing news alert sent to Discord.")
+        else:
+            logger.info("No missing news detected for any ticker.")
+            await self.log_health_check(f"No missing news detected for any ticker at {now_hkt}.")
+
+    async def health_check(self, session):
+        self.incidents = []
+        hkt_tz = pytz.timezone('Asia/Hong_Kong')
+        now_hkt = datetime.now(hkt_tz).strftime('%Y-%m-%d %H:%M HKT')
+        raw_news = []
+        logger.info(f"Starting sequential health check news fetching for all tickers at {now_hkt}...")
+        for ticker in self.tickers:
+            try:
+                news_for_ticker = await self.fetcher.fetch_single_ticker_news(ticker, session)
+                raw_news.extend(news_for_ticker)
+            except Exception as e:
+                logger.error(f"[Error] Failed to fetch news for {ticker} during health check: {e}")
+                self.incidents.append(f"Failed to fetch news for {ticker}: {str(e)}")
+            await asyncio.sleep(1)
+        logger.info(f"Finished fetching news for health check. Total items fetched: {len(raw_news)}")
+
+        if not raw_news:
+            logger.info(f"[Info] Health check: No news returned for test tickers at {now_hkt}. This is OK if there's genuinely no news.")
+            await self.log_health_check(f"No news returned for test tickers at {now_hkt}.")
+            health_message = (
+                f"[Info] **Health Check** at {now_hkt}\n"
+                f"Status: Healthy\n"
+                f"Details: No news returned for test tickers. This is expected if no new news exists.\n"
+                f"Incidents: {', '.join(self.incidents) if self.incidents else 'None'}"
+            )
+            await self._edit_pinned_message(health_message, news_id="HealthCheckInfo")
+            return True
+        
+        match_count = 0
+        for item in raw_news:
+            try:
+                if self.processor._news_exists(item):
+                    match_count += 1
+                else:
+                    self.incidents.append(f"News item not found on disk: {item['id']}")
+            except Exception as e:
+                logger.error(f"[Error] Error checking news item {item.get('id', 'N/A')} during health check: {e}")
+                self.incidents.append(f"Error checking news item {item.get('id', 'N/A')}: {str(e)}")
+
+        match_percentage = (match_count / len(raw_news)) * 100 if raw_news else 100
+        
+        if match_percentage >= 98:
+            logger.info(f"[Success] Health check: {match_percentage:.2f}% match. System is healthy at {now_hkt}.")
+            await self.log_health_check(f"Health check: {match_percentage:.2f}% match. System is healthy at {now_hkt}.")
+            health_message = (
+                f"[Success] **Health Check** at {now_hkt}\n"
+                f"Status: Healthy\n"
+                f"Details: {match_percentage:.2f}% of fetched news items match stored data.\n"
+                f"Incidents: {', '.join(self.incidents) if self.incidents else 'None'}"
+            )
+            await self._edit_pinned_message(health_message, news_id="HealthCheckSuccess")
+            return True
+        elif match_percentage >= 90:
+            missing_news_in_check = [item for item in raw_news if not self.processor._news_exists(item)]
+            for item in missing_news_in_check:
+                hkt_time = datetime.fromtimestamp(item['datetime'], tz=pytz.UTC).astimezone(hkt_tz).strftime('%Y-%m-%d %H:%M HKT')
+                message = (
+                    "##############\n"
+                    f"**Title**: {item['headline']}\n"
+                    f"**Ticker**: {item['ticker']}\n"
+                    f"**Time**: {hkt_time}\n"
+                    f"**URL**: {item['url']}\n" if item.get('url') else ""
+                    f"**Summary**: ||{item['summary']}||\n"
+                    f"**Source**: {item.get('source', 'Unknown')}\n"
+                    "##############"
+                )
+                await self.processor._send_discord(message, news_id=item['id'])
+            await self.processor._send_discord(f"[Warning] News leakage detected at ({match_percentage:.2f}% match) at {now_hkt}. Some news not found on disk during health check.", news_id="HealthCheckWarning")
+            await self.log_health_check(f"News leakage detected at {match_percentage:.2f}% match at {now_hkt}.")
+            health_message = (
+                f"[Warning] **Health Check** at {now_hkt}\n"
+                f"Status: Warning\n"
+                f"Details: {match_percentage:.2f}% match. Some news items not found on disk.\n"
+                f"Incidents: {', '.join(self.incidents) if self.incidents else 'None'}"
+            )
+            await self._edit_pinned_message(health_message, news_id="HealthCheckWarning")
+            logger.warning(f"[Warning] Health check warning: News leakage detected at ({match_percentage:.2f}% match) at {now_hkt}.")
+            return False
+        else:
+            await self.processor._send_discord(f"[Error] Significant news leakage detected (<90% match, {match_percentage:.2f}%) at {now_hkt}. Data integrity issue during health check.", news_id="HealthCheckError")
+            await self.log_health_check(f"Significant news leakage detected at {match_percentage:.2f}% match at {now_hkt}.")
+            health_message = (
+                f"[Error] **Health Check** at {now_hkt}\n"
+                f"Status: Failed\n"
+                f"Details: {match_percentage:.2f}% match. Significant data integrity issue detected.\n"
+                f"Incidents: {', '.join(self.incidents) if self.incidents else 'None'}"
+            )
+            await self._edit_pinned_message(health_message, news_id="HealthCheckError")
+            logger.error(f"[Error] Health check error: Significant news leakage detected at (<90% match, {match_percentage:.2f}%) at {now_hkt}.")
+            return False
+
+class Scheduler:
+    def __init__(self, tickers, batch_size, fetcher, processor, health_checker):
+        self.tickers = tickers
+        self.batch_size = batch_size
+        self.fetcher = fetcher
+        self.processor = processor
+        self.health_checker = health_checker
+        self.last_daily_clear_date = None
+        self.last_health_check = datetime.min.replace(tzinfo=pytz.UTC)
+
+    def _is_market_open(self):
+        us_tz = pytz.timezone('US/Eastern')
+        now = datetime.now(us_tz)
+        us_holidays = holidays.US(years=now.year)
+        return now.weekday() <= 4 and 9.25 <= now.hour + now.minute/60 < 16 and now.date() not in us_holidays
+
+    def _is_friday_6pm(self):
+        us_tz = pytz.timezone('US/Eastern')
+        now = datetime.now(us_tz)
+        return now.weekday() == 4 and now.hour == 18 and now.minute == 0
+
+    def _is_health_check_time(self, now_hkt, is_market_open):
+        minute = now_hkt.minute
+        if is_market_open:
+            return minute in (0, 30)  # Every 30 minutes during market hours
+        return minute == 0  # Every hour off-market
+
+    async def clear_storage(self, now_et):
+        hkt_tz = pytz.timezone('Asia/Hong_Kong')
+        now_hkt = datetime.now(hkt_tz).strftime('%Y-%m-%d %H:%M HKT')
+        logger.info(f"[Clear] Clearing news data and metadata for {now_hkt}...")
+        if os.path.exists(NEWS_STORAGE_DIR):
+            try:
+                shutil.rmtree(NEWS_STORAGE_DIR)
+                logger.info(f"Removed directory: {NEWS_STORAGE_DIR}")
+            except OSError as e:
+                logger.error(f"[Error] Error removing directory {NEWS_STORAGE_DIR}: {e}")
+        os.makedirs(NEWS_STORAGE_DIR, exist_ok=True)
+        self.processor.latest_ticker_timestamps = {}
+        self.processor._save_metadata()
+        await self.processor._send_discord(f"[Info] News data directory and metadata cleared at {now_hkt} for deduplication reset.", news_id="ClearStorage")
+        logger.info("Clear completed.")
+        self.last_daily_clear_date = now_et.date()
+
+    async def run(self):
+        logger.info("Starting news monitoring system...")
+        us_tz = pytz.timezone('US/Eastern')
+        hkt_tz = pytz.timezone('Asia/Hong_Kong')
+
+        while True:
+            now_utc = datetime.now(pytz.UTC)
+            now_et = now_utc.astimezone(us_tz)
+            now_hkt = now_utc.astimezone(hkt_tz)
+            
+            if self._is_friday_6pm():
+                await self.clear_storage(now_et)
+                await asyncio.sleep(60)
+                continue
+
+            if not self._is_market_open() and now_et.hour >= 16 and (self.last_daily_clear_date is None or self.last_daily_clear_date != now_et.date()):
+                await self.clear_storage(now_et)
+                await asyncio.sleep(60)
+                continue
+
+            is_market_open = self._is_market_open()
+            cycle_time_target = 10 if is_market_open else 600
+
+            start_time = datetime.now()
+            async with aiohttp.ClientSession() as session:
+                total_new = 0
+                for i in range(0, len(self.tickers), self.batch_size):
+                    batch = self.tickers[i:i + self.batch_size]
+                    try:
+                        news_items = await self.fetcher.fetch_batch(batch, session)
+                        total_new += await self.processor.process_batch(news_items, session)
+                    except Exception as e:
+                        logger.error(f"[Error] Failed to process batch: {e}")
+                        self.health_checker.incidents.append(f"Batch processing error: {str(e)}")
+                    if i < len(self.tickers) - self.batch_size:
+                        await asyncio.sleep(1)
+                
+                logger.info(f"Processed batch cycle. Total new items: {total_new}")
+
+                if is_market_open:
+                    try:
+                        await self.health_checker.check_missing_news(session, is_market_open)
+                    except Exception as e:
+                        logger.error(f"[Error] Failed to check missing news: {e}")
+                        self.health_checker.incidents.append(f"Missing news check error: {str(e)}")
+
+                if self._is_health_check_time(now_hkt, is_market_open):
+                    now_hkt_str = now_hkt.strftime('%Y-%m-%d %H:%M HKT')
+                    logger.info(f"Running health check at {now_hkt_str}...")
+                    await self.health_checker.log_health_check(f"Starting health check at {now_hkt_str}")
+                    try:
+                        if not await self.health_checker.health_check(session):
+                            await self.processor._send_discord(f"[Alert] Health check failed at {now_hkt_str}! Review logs for details.", news_id="HealthCheckFailure")
+                            await self.health_checker.log_health_check(f"Health check failed at {now_hkt_str}.")
+                            logger.error(f"Health check failed at {now_hkt_str}, pausing for 60 seconds.")
+                            await asyncio.sleep(60)
+                            continue
+                    except Exception as e:
+                        await self.health_checker.log_health_check(f"Health check error at {now_hkt_str}: {str(e)}")
+                        logger.error(f"[Error] Health check error at {now_hkt_str}: {e}")
+                        self.health_checker.incidents.append(f"Health check error: {str(e)}")
+                    self.last_health_check = now_utc
+                    logger.info(f"Health check completed at {now_hkt_str}.")
+
+            elapsed_time = (datetime.now() - start_time).total_seconds()
+            sleep_time = max(cycle_time_target - elapsed_time, 0)
+            if is_market_open and sleep_time < 6:
+                sleep_time = 6
+            if sleep_time > 0:
+                logger.info(f"Sleeping for {sleep_time:.2f} seconds...")
+                await asyncio.sleep(sleep_time)
+
+
+async def main():
+    fetcher = NewsFetcher(FINNHUB_API_KEY)
+    processor = NewsProcessor(NEWS_STORAGE_DIR, DISCORD_WEBHOOK, DISCORD_ALERTS)
+    health_checker = HealthChecker(fetcher, processor, TICKERS)
+    scheduler = Scheduler(TICKERS, BATCH_SIZE, fetcher, processor, health_checker)
+    logger.info(f"[Chart] Monitoring {len(TICKERS)} stocks (batch size: {BATCH_SIZE})")
+    await scheduler.run()
+
+if __name__ == "__main__":
+    asyncio.run(main())
