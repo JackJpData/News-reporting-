@@ -1,0 +1,90 @@
+# In NewsFetcher class
+async def fetch_batch(self, tickers, session, max_concurrent=2):
+    semaphore = asyncio.Semaphore(max_concurrent)
+    async def fetch_with_limit(ticker):
+        async with semaphore:
+            try:
+                return await self.fetch_single_ticker_news(ticker, session)
+            except Exception as e:
+                logger.error(f"[Error] Failed to fetch {ticker}: {e}")
+                return ticker, str(type(e).__name__), str(e)
+
+    tasks = [fetch_with_limit(ticker) for ticker in tickers]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    all_news = []
+    failed_tickers = []
+
+    # Load existing failed tickers
+    failed_tickers_path = FAILED_TICKERS_FILE
+    if os.path.exists(failed_tickers_path):
+        with open(failed_tickers_path, 'r') as f:
+            failed_data = json.load(f)
+    else:
+        failed_data = {"failed_tickers": []}
+
+    for ticker, result in zip(tickers, results):
+        if isinstance(result, tuple):  # Failed request
+            failed_tickers.append({"ticker": ticker, "error_type": result[1], "error_message": result[2]})
+        else:  # Successful request
+            all_news.extend(result)
+
+    # Append new failed tickers
+    failed_data["failed_tickers"].extend(failed_tickers)
+    with open(failed_tickers_path, 'w') as f:
+        json.dump(failed_data, f, indent=2)
+
+    return all_news
+
+# In NewsMonitor class
+async def monitor_news(self):
+    async with aiohttp.ClientSession() as session:
+        while True:
+            cycle_start = datetime.now(pytz.UTC)
+            logger.info(f"[Chart] Monitoring {len(self.tickers)} stocks (batch size: {self.batch_size})")
+            logger.info("Starting news monitoring system...")
+
+            # Initialize failed tickers file
+            failed_tickers_path = FAILED_TICKERS_FILE
+            with open(failed_tickers_path, 'w') as f:
+                json.dump({"failed_tickers": []}, f, indent=2)
+
+            is_market_open = self._is_market_open()
+            cycle_sleep = 60 if is_market_open else 300  # 60s for 60/min, 300s otherwise
+
+            total_items = 0
+            for i in range(0, len(self.tickers), self.batch_size):
+                batch = self.tickers[i:i + self.batch_size]
+                logger.debug(f"Processing batch {batch}")
+                batch_start = datetime.now(pytz.UTC)
+                news_items = await self.fetcher.fetch_batch(batch, session, max_concurrent=2)
+                batch_end = datetime.now(pytz.UTC)
+                batch_duration = (batch_end - batch_start).total_seconds()
+                logger.info(f"[Info] Processed {len(news_items)} items for batch {batch} in {batch_duration:.2f}s")
+                total_items += len(news_items)
+                await asyncio.sleep(1)
+
+            # Retry failed tickers
+            if os.path.exists(failed_tickers_path):
+                with open(failed_tickers_path, 'r') as f:
+                    failed_data = json.load(f)
+                failed_tickers = [item["ticker"] for item in failed_data["failed_tickers"]]
+                if failed_tickers:
+                    logger.info(f"Retrying {len(failed_tickers)} failed tickers: {failed_tickers}")
+                    for ticker in failed_tickers:
+                        try:
+                            news_items = await self.fetcher.fetch_single_ticker_news(ticker, session)
+                            total_items += len(news_items)
+                            logger.info(f"[Retry] Successfully fetched {len(news_items)} items for {ticker}")
+                        except Exception as e:
+                            logger.error(f"[Retry] Failed to fetch {ticker} after retries: {e}")
+                        # Remove ticker from failed list
+                        failed_data["failed_tickers"] = [item for item in failed_data["failed_tickers"] if item["ticker"] != ticker]
+                        with open(failed_tickers_path, 'w') as f:
+                            json.dump(failed_data, f, indent=2)
+
+            cycle_end = datetime.now(pytz.UTC)
+            cycle_time = (cycle_end - cycle_start).total_seconds()
+            logger.info(f"End of a cycle. Cycle took {cycle_time:.2f} seconds. Total new items: {total_items}")
+
+            if cycle_time < cycle_sleep:
+                await asyncio.sleep(cycle_sleep - cycle_time)
